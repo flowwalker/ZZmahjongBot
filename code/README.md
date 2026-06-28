@@ -1,9 +1,9 @@
-# ZZMahjongBot — 助教验证指南
+# ZZMahjongBot — 代码使用说明
 
 > 国标麻将 AI，Botzone 积分赛排名 17（1289分），模拟赛排名 11（1410分）。
 > 论文见 `paper.pdf`。
 
-本指南按顺序引导验证：**环境 → 单版本 → 批量 → 演进线 → 对战 → 对照论文**。
+这份代码是国标麻将 AI 的完整实验记录，包含从最初 6 通道 CNN 到最终 Dual Path 架构的 24 个 bot 版本，以及特征工程、数据增强、训练管线等各维度的演进。下面是一些可以运行的命令，方便快速上手和检查各模块是否正常工作。
 
 ---
 
@@ -16,105 +16,65 @@ python3 --version
 # 2. 安装依赖
 pip install torch numpy
 
-# 3. 安装 PyMahjongGB（国标麻将算番库，所有 feature 版本依赖）
+# 3. 安装 PyMahjongGB（国标麻将算番库）
 pip install PyMahjongGB
 
-#    Linux 上直接安装即可。Mac Apple Silicon 若编译失败，使用：
+#    Linux 上直接安装即可。Mac Apple Silicon 若编译失败，尝试：
 #    CC=/opt/homebrew/opt/llvm/bin/clang \
 #    CXX=/opt/homebrew/opt/llvm/bin/clang++ \
 #    LDFLAGS="-L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++" \
 #    pip install PyMahjongGB
 
-# 4. 验证安装
+# 4. 确认安装
 python3 -c "from MahjongGB import MahjongFanCalculator; print('PyMahjongGB OK')"
 
-# 5. 确认当前在 code/ 下
-pwd         # 应该以 archive/code 结尾（或 code/ 结尾）
-ls tools/   # 应该看到 validate_version.py, tournament.py 等
+# 5. 进入 code/ 目录
+pwd         # 当前位置应为 code/
+ls tools/   # 应看到 validate_version.py, tournament.py 等
 ```
 
 ---
 
-## 步骤 1：验证单个版本（管线完整性）
+## 快速检查：单个版本的预处理+训练管线
 
-验证一个 Bot 版本能否完成 **预处理 → 数据加载 → 小批次 SL 训练** 全流程。
+`tools/validate_version.py` 会对指定版本做一轮小规模的预处理和训练，检查整个管线是否跑通：
 
 ```bash
 cd tools
 python3 validate_version.py v2_baseline
 ```
 
-**期望输出**：
-```
-📁 版本: v2_baseline
-📋 Step 1: 拷贝文件...
-📋 Step 2: 提取前 5 局数据...
-📋 Step 3: 运行预处理 (preprocess.py)...
-   ✅ 预处理完成
-📋 Step 4: 小批次 SL 训练 (10 batches × 64)...
-   模型类: CNNModel     OBS_SIZE: 16     ACT_SIZE: 235
-   batch 1/4: loss=2.0...   batch 4/4: loss=1.5...   ✅ 训练完成
-✅ 版本 'v2_baseline' 验证通过！
+正常的话会看到预处理完成、几 batch 训练 loss 下降。整个过程约 30 秒。
+
+文件里面内置了data.txt的小型测试版本data_test.txt，因此可以进行小型验证
+
+对其他版本也可以用同样方式跑：
+
+```bash
+python3 validate_version.py v3_cnn_Res_Mish_SE_standard   # 首次引入 SE 注意力
+python3 validate_version.py v14best_cnnSE_preload2x       # CNN-SE 金字塔, 160ch
+python3 validate_version.py v16_dual_light_2x             # Dual Path 轻量版
 ```
 
-这证明了：feature 提取 → 数据预处理 → 模型前向/反向传播 → 参数更新 全链路正常。
+`human_design_versions` 是纯规则 bot（不含神经网络，按向听数+牌效贪心决策），所以不适用于这个脚本。
 
 ---
 
-## 步骤 2：批量验证关键版本
+## 特征工程演进
 
-以下是论文中重点讨论的 4 个代表性版本，覆盖了架构演进的关键节点：
-
-```bash
-cd tools
-
-# 依次验证（每个约 30 秒）
-python3 validate_version.py v2_baseline          # CNN 基础版，16ch
-python3 validate_version.py v3_cnn_Res_Mish_SE_standard  # 首次引入 SE 注意力
-python3 validate_version.py v14best_cnnSE_preload2x      # CNN-SE 金字塔，160ch（最终部署基础）
-python3 validate_version.py v16_dual_light_2x            # Dual Path 双路并行（轻量版）
-```
-
-或一键批量：
-```bash
-python3 -c "
-import subprocess, sys
-for v in ['v2_baseline', 'v3_cnn_Res_Mish_SE_standard', 'v14best_cnnSE_preload2x', 'v16_dual_light_2x']:
-    r = subprocess.run([sys.executable, 'validate_version.py', v], capture_output=True, text=True, timeout=120)
-    ok = 'PASS' if r.returncode == 0 else 'FAIL'
-    print(f'{ok} {v}')
-"
-```
-
-**验证 24 个全部版本** (约 10 分钟)：
-```bash
-for d in ../bot_All_Versions/*/; do
-    v=$(basename "$d")
-    if [ -f "$d/feature.py" ] && [ -f "$d/model.py" ]; then
-        python3 validate_version.py "$v" 2>&1 | tail -1
-    fi
-done
-```
-
-> **预期结果**：24 个版本全部通过（除 `human_design_versions`——它是人工规则 bot，无需 feature/model，自然不适用此脚本）。
-
----
-
-## 步骤 3：特征工程演进验证（论文 §5.1）
-
-特征通道从 6ch → 160ch 的演进，每个版本定义在 `features/` 目录下：
+特征通道从 6ch 逐步演进到 160ch，每个版本在 `features/` 下：
 
 ```bash
 cd tools
-# 列出特征版本
 ls ../features/v*.py
 ```
 
+查看各版本的通道数：
+
 ```bash
-# 验证每个特征版本的 OBS_SIZE（需 bot 目录提供 agent.py 基类）
 python3 -c "
 import sys
-sys.path.insert(0, '../bot_All_Versions/v2_baseline')   # 提供 agent.py
+sys.path.insert(0, '../bot_All_Versions/v2_baseline')
 sys.path.insert(0, '../features')
 for f in ['v1_6ch_minimal', 'v2_16ch_visible', 'v3_148ch_discard_history', 
           'v4_224ch_semantic', 'v5_155ch_aux_state', 'v6_160ch_meld21']:
@@ -123,39 +83,25 @@ for f in ['v1_6ch_minimal', 'v2_16ch_visible', 'v3_148ch_discard_history',
 "
 ```
 
-**期望输出**：
-```
-   6ch  v1_6ch_minimal
-  16ch  v2_16ch_visible
- 148ch  v3_148ch_discard_history
- 224ch  v4_224ch_semantic
- 155ch  v5_155ch_aux_state
- 160ch  v6_160ch_meld21
-```
-
-论文中的"6ch→16ch→148ch→224ch(放弃)→155ch→160ch"路线由此可证。
-
-详细说明见 `features/FEATURE.md`。
+输出大致为 6ch → 16ch → 148ch → 224ch → 155ch → 160ch。其中 224ch 版本因 Python 预处理耗时过长被放弃，最终收敛到 160ch。详细说明见 `features/FEATURE.md`。
 
 ---
 
-## 步骤 4：模型架构演进验证（论文 §5.2）
+## 模型架构演进
 
-11 个模型架构从纯 CNN 到 Dual Path，定义在 `models/` 目录下：
+11 个模型版本在 `models/` 下，覆盖了从纯 CNN 到 Dual Path 的完整探索：
 
 ```bash
 cd tools
-# 列出模型版本
 ls ../models/v*.py
 ```
 
+实例化几个代表性模型，跑一次前向传播确认结构正常：
+
 ```bash
-# 验证每个模型可实例化、可前向传播
 python3 -c "
 import sys, torch
 sys.path.insert(0, '../models')
-
-# 逐一实例化（代表性的 5 个）
 tests = [
     ('v1_cnn_3layer_6ch',       6),
     ('v2_cnn_se_4block_16ch',   16),
@@ -174,108 +120,88 @@ for name, ch in tests:
     x = torch.randn(1, ch, 4, 9)
     y = m({'observation': x, 'action_mask': torch.ones(1, 235)})
     params = sum(p.numel() for p in m.parameters())
-    print(f'✅ {name:<35}  {params/1e6:5.1f}M params,  output OK')
+    print(f'{name:<35}  {params/1e6:5.1f}M params,  forward OK')
 "
 ```
-
-**期望输出**：5 个模型均显示 `✅ ... output OK`，参数量与实际架构匹配。其中 v9_dual_light 约 3.6M 参数，与论文中"Dual Light 3.56M"一致。
 
 详细说明见 `models/MODEL.md`。
 
 ---
 
-## 步骤 5：Bot 对战测试
+## Bot 对战
 
-`tools/tournament.py` 从 `bot_All_Versions/` 动态加载任意 Bot 进行麻将对局。
-
-### 5.1 列出可用 Bot
+`tools/tournament.py` 可以从 `bot_All_Versions/` 加载任意 bot 进行麻将对局：
 
 ```bash
 cd tools
+
+# 列出可用 bot
 python3 tournament.py --list
-```
 
-### 5.2 四 Bot 混战
-
-```bash
-# 4 个不同版本各坐一家，打 20 局（约 2 分钟）
+# 四个版本混战 20 局
 python3 tournament.py -n 20 v2_baseline v3_cnn_Res_Mish_SE_standard v14best_cnnSE_preload2x v16_dual_light_2x
 ```
 
-**期望输出**：每 20 局打印一次实时排名（总分、场均、胜率、🥇🥈🥉分布），最后给出汇总表。
-
-### 5.3 同模型四家混战（检一致性）
-
-```bash
-# v14 对自己 ×4，验证模型在相同局面下的决策一致性
-python3 tournament.py -n 10 v14best v14best v14best v14best
-```
-
-> **已知限制**：当前版本洗牌随机性不足，同一副牌的牌面分布在重复对局中变化有限。结果仅供参考，已在 `tools/NOTE.md` 中说明。
+> 注意：当前版本的洗牌随机性不太够，同一副牌在不同对局中的变化有限，结果只能作为大致参考。这个问题在 `tools/NOTE.md` 里有说明。
 
 ---
 
-## 步骤 6：对照论文
+## 论文与代码对应
 
-阅读 `paper.pdf` 后，可对照以下映射表在代码中找到对应实现：
-
-| 论文段落 | 代码位置 | 关键文件 |
-|----------|---------|---------|
-| §2.1 SE 通道注意力 | `models/v2_cnn_se_4block_16ch.py` | SE 模块首次引入 |
-| §2.2 160ch 特征 | `features/v6_160ch_meld21.py` | 最终特征版本 |
-| §2.3 TTA + 投票 | `mains/` | Botzone 部署入口 |
-| §2.4 CNN-SE 金字塔 (v8) | `models/v8_cnn_se_pyramid_160ch.py` | 最终部署模型 |
-| §2.4 Dual Path | `models/v9_dual_light_160ch.py` | 双路并行架构 |
-| §2.5 内存预加载 | `datasets/` | MemPreloadDataset |
-| §2.5 数据增强 288-fold | `augments/` | 群论增强实现 |
-| §3.1 全架构拼接崩溃 | `models/v6_gated_fusion_224ch.py`, `v7_multibranch_cross_attn_224ch.py` | 标 "fail" 的版本 |
-| §3.2 v 头失败 | `rl_failure/` | RL PPO 尝试记录 |
-| §3.5 288× 灾难 | `bot_All_Versions/v22_no_time_cnnSE_preload288x/` | 标 "no_time" |
-| §5.1 特征演进 | `features/` + `features/FEATURE.md` | 6 版演进说明 |
-| §5.2 模型演进 | `models/` + `models/MODEL.md` | 11 版演进说明 |
-| Botzone 最终提交 | `bot_All_Versions/botzone_versions/bot_final_upload/` | 实际提交的 `__main__.py` |
+| 论文段落 | 代码位置 |
+|----------|---------|
+| §2.1 SE 通道注意力 | `models/v2_cnn_se_4block_16ch.py` |
+| §2.2 160ch 特征 | `features/v6_160ch_meld21.py` |
+| §2.3 TTA + 多模型投票 | `mains/` |
+| §2.4 CNN-SE 金字塔 | `models/v8_cnn_se_pyramid_160ch.py` |
+| §2.4 Dual Path | `models/v9_dual_light_160ch.py` |
+| §2.5 内存预加载 | `datasets/` |
+| §2.5 数据增强 288-fold | `augments/` |
+| §3.1 全架构拼接崩溃 | `models/v6_gated_fusion_224ch.py`, `v7_multibranch_cross_attn_224ch.py` |
+| §3.2 v 头失败 | `rl_failure/` |
+| §3.5 288× 灾难 | `bot_All_Versions/v22_no_time_cnnSE_preload288x/` |
+| §5.1 特征演进 | `features/` + `features/FEATURE.md` |
+| §5.2 模型演进 | `models/` + `models/MODEL.md` |
+| Botzone 最终提交 | `bot_All_Versions/botzone_versions/bot_final_upload/` |
 
 ---
 
-## 目录结构速查
+## 目录结构
 
 ```
 code/
-├── tools/                          ★ 入口：验证和对战脚本
-│   ├── validate_version.py         验证单个版本的完整管线
-│   ├── tournament.py               Bot 对战锦标赛
-│   ├── export_weights.py           权重导出
-│   └── data_test.txt               测试用数据（前 5 局）
+├── tools/                         入口脚本
+│   ├── validate_version.py        检查单个版本管线是否通
+│   ├── tournament.py              Bot 对战
+│   ├── export_weights.py          权重导出
+│   └── data_test.txt              测试用数据（前 5 局）
 │
-├── bot_All_Versions/               ★ 24 个 Bot 版本（每个含 feature/model/agent/preprocess 等）
-│   ├── v1_starter/                 起点：3层CNN, 6ch
-│   ├── v2_baseline/                baseline: 3层CNN, 16ch
-│   ├── v3_cnn_Res_Mish_SE_standard/ 首次引入 SE + CoordConv + Mish
-│   ├── v6_to_148ch_add_lstm_attn/   引入 BiLSTM+SelfAttention, 148ch（质的飞跃）
-│   ├── v14best_cnnSE_preload2x/    CNN-SE 金字塔, 160ch, 2×增强（最终部署基础）
+├── bot_All_Versions/              24 个 Bot 版本
+│   ├── v1_starter/                起点：3层CNN, 6ch
+│   ├── v2_baseline/               3层CNN, 16ch
+│   ├── v3_cnn_Res_Mish_SE_standard/ 引入 SE + CoordConv + Mish
+│   ├── v6_to_148ch_add_lstm_attn/   引入 BiLSTM+SA, 148ch
+│   ├── v14best_cnnSE_preload2x/    CNN-SE 金字塔, 160ch, 2×增强
 │   ├── v16_dual_light_2x/          Dual Path 轻量版, 160ch
 │   ├── v19best_cnnSE_preload2x_3vote/ 3模型投票版
-│   ├── v20best_cnnSE_preload2x_3vote50x/ 3模型×50 TTA（Botzone最终提交版）
-│   ├── botzone_versions/           实际提交 Botzone 的历史版本
-│   └── ...                         其余版本（含失败的探索）
+│   ├── v20best_cnnSE_preload2x_3vote50x/ 3模型×50 TTA
+│   ├── botzone_versions/           实际提交 Botzone 的版本
+│   └── ...                        其余版本
 │
-├── features/                       特征工程演进（6版, 6ch→160ch）
-├── models/                         模型架构演进（11版, CNN→Dual）
+├── features/                       特征工程演进（6版）
+├── models/                         模型架构演进（11版）
 ├── preprocess_s/                   数据预处理演进（4版）
-├── datasets/                       数据集加载演进（5版, 含MemPreload）
+├── datasets/                       数据集加载演进（5版）
 ├── augments/                       数据增强（288-fold群论结构）
 ├── sl_pretrains/                   SL训练脚本演进（3版）
 ├── mains/                          Botzone部署入口演进（3版）
-├── rl_failure/                     RL强化学习失败记录（诚实存档）
+├── rl_failure/                     RL尝试记录
 └── README.md                       本文件
 ```
 
 ---
 
-## 可能的问题与回答
+## 一些说明
 
-**Q: `human_design_versions/` 为什么不通过验证？**
-A: 它是纯规则 bot（基于向听数+牌效的贪心策略），不含神经网络，无需 feature/model，只需上传 `human_design.py` 到 Botzone 即可运行。`validate_version.py` 的设计目标是验证神经网络 Bot，不适配规则 bot。
-
-**Q: 部分版本目录名带 "fail" 或 "no_time" 是什么意思？**
-A: 诚实标注——`fail`=训练发散或架构不可训，`no_time`=设计完成但因算力/时间未充分训练。论文 §3 对这些失败做了详细分析。
+- 目录名中的 `fail` 表示训练发散或架构不可训，`no_time` 表示设计完成但因算力/时间未充分训练。这些失败的尝试在论文 §3 中有详细分析。
+- 代码中的探索远多于论文能容纳的内容，各子目录下的 `*.md` 文件补充了更多细节，欢迎进一步了解和完善。

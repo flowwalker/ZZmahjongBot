@@ -1,6 +1,6 @@
-# ZZMahjongBot — 国标麻将 AI
+# ZZMahjongBot — 国标麻将 AI — by flowwalker (wly-AI基班)
 
-> 陈治中 2500012905 | Botzone 积分赛排名 17 (1289分) | 模拟赛排名 11 (1410分)
+> Botzone 积分赛排名 17 (1289分) | 模拟赛排名 11 (1410分)
 
 ## 提交内容
 
