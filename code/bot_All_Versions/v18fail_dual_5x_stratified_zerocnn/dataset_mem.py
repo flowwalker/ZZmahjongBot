@@ -1,0 +1,186 @@
+"""内存预加载数据集 — 延迟增强."""
+
+import numpy as np
+import json
+import os
+import time
+import torch
+from torch.utils.data import Dataset, Sampler
+
+from augment import get_transforms_by_level, get_random_transforms, apply_transform
+
+
+class MemPreloadDataset(Dataset):
+    """
+    虚拟长度 = n_aug × 原始样本数。
+    __init__ 一次性加载所有 npz → 3 个大数组 (int8)。
+    __getitem__ 纯内存索引 + int8 解码 + 变换。
+
+    三种模式:
+      1. per_sample_random=True: n_aug 强制为 1，每次 __getitem__ 从 288 随机取 1 变换
+      2. stratified_random=True:   n_aug 强制为 2，每次 __getitem__ 四维度分层取 2 个变换（花色排列上不同）
+      3. per_sample_random=False:  固定 n_aug 个变换，每个样本逐一增强（原有行为）
+    """
+
+    def __init__(self, data_dir='data', begin=0.0, end=1.0, n_aug=288,
+                 per_sample_random=False, stratified_random=False):
+        t0 = time.time()
+
+        with open(os.path.join(data_dir, 'count.json')) as f:
+            self.match_samples = json.load(f)
+
+        total_matches = len(self.match_samples)
+        self.begin = int(begin * total_matches)
+        self.end = int(end * total_matches)
+        self.match_samples = self.match_samples[self.begin:self.end]
+
+        n_matches = len(self.match_samples)
+        self.n_raw = sum(self.match_samples)
+        self.per_sample_random = per_sample_random
+        self.stratified_random = stratified_random
+        if self.stratified_random:
+            n_aug = 2  # 双花色: 每原始样本产出 2 个增强版本
+        elif self.per_sample_random:
+            n_aug = 1  # 每样本随机 1/288
+        self.n_aug = n_aug
+        self._epoch_seed = 0
+
+        self.data_dir = data_dir
+
+        # obs:  (N, 160, 4, 9)  int8
+        # mask: (N, 235)         int8
+        # act:  (N,)             int64
+        print(f'[MemPreload] Allocating {self.n_raw:,} × (160×4×9 + 235 + 8) bytes...')
+        self.all_obs = np.empty((self.n_raw, 160, 4, 9), dtype=np.int8)
+        self.all_mask = np.empty((self.n_raw, 235), dtype=np.int8)
+        self.all_act = np.empty((self.n_raw,), dtype=np.int64)
+
+        offset = 0
+        for i, n_samples in enumerate(self.match_samples):
+            match_id = self.begin + i
+            d = np.load(os.path.join(data_dir, f'{match_id}.npz'))
+            n = d['act'].shape[0]
+            assert n == n_samples, f'match {match_id}: expected {n_samples}, got {n}'
+
+            self.all_obs[offset:offset + n] = d['obs']
+            self.all_mask[offset:offset + n] = d['mask']
+            self.all_act[offset:offset + n] = d['act']
+            d.close()
+            offset += n
+
+            # 进度报告
+            if (i + 1) % 10000 == 0:
+                elapsed = time.time() - t0
+                mb_loaded = offset * (160 * 4 * 9 + 235) / (1024 * 1024)
+                print(f'[MemPreload] Loaded {i+1}/{n_matches} matches, '
+                      f'{offset:,} samples, {mb_loaded:.0f} MB, {elapsed:.1f}s')
+
+        elapsed = time.time() - t0
+        total_mb = offset * (160 * 4 * 9 + 235 + 8) / (1024 * 1024)
+        print(f'[MemPreload] Done: {n_matches} matches, {self.n_raw:,} raw samples '
+              f'× {self.n_aug} → {len(self):,} virtual samples')
+        print(f'[MemPreload] Memory: {total_mb:.0f} MB loaded in {elapsed:.1f}s '
+              f'({self.n_raw/elapsed:.0f} samples/s)')
+
+        # 加载变换表
+        if self.stratified_random:
+            # 加载全部 288 变换，__getitem__ 中每次分层：ds(1/2)×sp(2/6)×hp(1/6)×wp(1/4)
+            self.transforms = get_transforms_by_level(288)
+            print(f'[MemPreload] Stratified dual-suit: ds(1/2)×sp(2/6)×hp(1/6)×wp(1/4) per __getitem__')
+        elif self.per_sample_random:
+            # 加载全部 288 变换，__getitem__ 中每次随机取 1 个
+            self.transforms = get_transforms_by_level(288)
+            print(f'[MemPreload] Per-sample random: 1/288 random transform per __getitem__')
+        elif self.n_aug in (2, 12, 24, 72, 288):
+            self.transforms = get_transforms_by_level(self.n_aug)
+            print(f'[MemPreload] Using {len(self.transforms)}/{288} fixed transforms (level={self.n_aug}×)')
+        else:
+            self.transforms = get_random_transforms(self.n_aug)
+            print(f'[MemPreload] Using {len(self.transforms)}/{288} random transforms (n={self.n_aug})')
+
+    def reshuffle_transforms(self, seed=None):
+        """
+        Re-sample n_aug transforms randomly from the full 288 pool.
+
+        Call this at the start of each epoch for per-epoch transform diversity.
+        Identity transform (idx 0) is always included as the first transform.
+
+        Args:
+            seed: optional random seed for reproducibility
+        """
+        if self.stratified_random:
+            self._epoch_seed += 1  # 每 epoch 换种子，变换组合不同
+            print(f'[MemPreload] Stratified epoch_seed={self._epoch_seed}')
+            return
+        if self.per_sample_random:
+            return  # 每次 __getitem__ 都随机取，无需 reshuffle
+        if self.n_aug in (2, 12, 24, 72, 288):
+            print(f'[MemPreload] Fixed level={self.n_aug}× — transforms do not change')
+            return
+        self.transforms = get_random_transforms(self.n_aug, seed=seed)
+        print(f'[MemPreload] Reshuffled: {len(self.transforms)} random transforms')
+
+    def __len__(self):
+        return self.n_raw * self.n_aug
+
+    def __getitem__(self, idx):
+        if self.stratified_random:
+            # n_aug=2，同一样本两个变换仅在 sp 维度不同
+            raw_idx = idx // 2
+            tf_idx = idx % 2
+            # 用 raw_idx + epoch_seed 确定性生成 ds/hp/wp 和一对 sp
+            rng = np.random.RandomState(raw_idx * 37 + self._epoch_seed * 1000003)
+            ds = rng.randint(0, 2)
+            hp = rng.randint(0, 6)
+            wp = rng.randint(0, 4)
+            sp_pair = rng.choice(6, size=2, replace=False)
+            sp = sp_pair[tf_idx]
+            tf_index_full = ds * 144 + sp * 24 + hp * 4 + wp
+            tf = self.transforms[tf_index_full]
+        elif self.per_sample_random:
+            # n_aug=1, idx 就是原始索引；每次随机取 1/288 变换
+            raw_idx = idx
+            tf = self.transforms[np.random.randint(0, 288)]
+        else:
+            raw_idx = idx // self.n_aug
+            tf_idx = idx % self.n_aug
+            tf = self.transforms[tf_idx]
+
+        obs = self.all_obs[raw_idx].astype(np.float32)
+        obs[37:41] /= 21.0          # ch37-40  WALL
+        obs[154] /= 3.0             # ch154    TILE_FROM
+        obs[157:160] /= 14.0        # ch157-159 HAND_SIZE
+        mask = self.all_mask[raw_idx].astype(np.float32)
+        act = int(self.all_act[raw_idx])
+
+        aug_obs, aug_mask, aug_act = apply_transform(obs, mask, act, tf)
+
+        return aug_obs, aug_mask, aug_act
+
+
+class LazyAugSampler(Sampler):
+    """
+    轻量 Sampler — 只 shuffle 原始索引 (N ≈ 5.87M)，避免 randperm(N*n_aug) 爆炸。
+
+    策略: 对 n_aug 个变换逐一 shuffle 原始索引。
+    - 每个 batch 包含 batch_size 个不同原始样本 (同一变换)
+    - 每个 epoch 总 yield N*n_aug 个索引，所有(样本, 变换)对全覆盖
+    - 峰值内存 ~47MB (randperm 5.87M)，vs 全量 randperm 的 6-54GB
+
+    变换间分组对 GroupNorm 无影响 (GN 不跨 batch)。
+    """
+
+    def __init__(self, n_raw, n_aug=288):
+        self.n_raw = n_raw
+        self.n_aug = n_aug
+
+    def __len__(self):
+        return self.n_raw * self.n_aug
+
+    def __iter__(self):
+        n = self.n_raw
+        for t in range(self.n_aug):
+            perm = torch.randperm(n)
+            base = t
+            for r in perm.numpy():
+                yield int(r) * self.n_aug + base
